@@ -1,0 +1,342 @@
+================================================================================
+  EasyCNC JOB SYSTEM — Complete Documentation
+  How G-code files are streamed to the CNC firmware reliably
+================================================================================
+
+TABLE OF CONTENTS
+  1. What is a Job?
+  2. End-to-End Flow
+  3. Wire Protocol Commands (RSP)
+  4. Reliability Mechanisms
+  5. Pause / Resume / Abort
+  6. Test Results (verified working)
+  7. How to Replicate in Another Control Software
+
+
+================================================================================
+1. WHAT IS A JOB?
+================================================================================
+
+A "job" is the process of sending an entire G-code file (e.g. .gcode, .nc, .tap)
+to the CNC firmware for execution. It uses a reliable, pipelined, two-level
+acknowledged protocol over a serial/USB-CDC link.
+
+Key properties:
+  - No data loss     -> windowed transmission + retransmission on timeout
+  - No corruption    -> CRC32 validated by device; corrupted frames are NAK'd
+  - No duplication   -> every (re)send keeps its seq number; duplicate ACKs ignored
+  - Strict ordering  -> seq enforced; a gap makes the host resend from the gap
+  - Flow control     -> device NAKs with ST_ERR_BUFFER when planner is full
+
+
+================================================================================
+2. END-TO-END FLOW
+================================================================================
+
+  USER ACTION              BACKEND (server.py)              FIRMWARE
+  ───────────              ──────────────────              ────────
+
+  1. Select .gcode file
+     (browser reads file,
+      strips comments)
+
+  2. Click "Run"
+     ── POST /api/job/upload ──►
+
+                           3. Pre-process lines:
+                              - Normalize units (G20→G21, scale to mm)
+                              - Expand arcs (G2/G3 → G1 segments)
+
+                           4. Machine.upload_job()
+                              - Assign job_id
+                              - Reset tracking state
+                              - Suppress heartbeats
+
+                           5. Machine.start_job()
+                              - Spawn _sender_loop() thread
+                              ── OP_JOB_START ──►
+                                 (job_id, total_lines)
+                                                      Accept job,
+                                                      reset planner
+
+                              ── OP_JOB_LINE x N ──►  (pipelined)
+                                 (job_id, line_no, gcode)
+                                                      ACK each line
+                                                      (accepted into planner)
+                                                      ◄── ACK(seq)
+
+                                                      Execute lines in order
+                                                      ◄── EV_EXECUTED
+                                                      (job_id, line_no, x, y, z)
+
+                           6. _sender_loop() tracks:
+                              - _sent_up_to: lines transmitted
+                              - _executed: lines confirmed run
+                              - Credits: sent - executed < depth(8)
+
+                              ── OP_JOB_END ──►
+                                                      ◄── EV_JOB_DONE
+
+  7. UI polls progress
+     ── GET /api/job/status ──►
+     ◄── {done, total, stalled}
+
+
+================================================================================
+3. WIRE PROTOCOL COMMANDS (RSP)
+================================================================================
+
+All commands are defined in backend/rsp/defs.py and encoded in backend/rsp/codec.py.
+
+3a. Host → Device Commands (opcodes)
+
+  OPCODE  NAME               PAYLOAD                    PURPOSE
+  ──────  ────               ───────                    ───────
+  0x01    OP_GET_STATUS      (empty)                    Request telemetry reply
+  0x02    OP_PING            nonce byte                 Latency check
+  0x03    OP_GET_RUN_STATE   (empty)                    Get job/position state
+  0x04    OP_GET_CONFIG      (empty)                    Get machine config JSON
+  0x05    OP_SOFT_RESET      (empty)                    Reset WCS offsets
+  0x06    OP_UNLOCK          (empty)                    Clear alarm state
+  0x07    OP_E_STOP          (empty)                    Emergency stop (kill power)
+  0x08    OP_FEED_HOLD       (empty)                    Pause motion
+  0x09    OP_RESUME          (empty)                    Resume from hold
+  0x0A    OP_JOG             axis(u8), dir(u8),         Jog an axis
+                             dist(f32), feed(f32)
+  0x0B    OP_HOME            axis_mask(u8)              Home axes
+  0x0C    OP_ZERO            axis_mask(u8)              Zero WCS for axes
+  0x0D    OP_JOB_START       job_id(u16),               BEGIN JOB
+                             total_lines(u16)
+  0x0E    OP_JOB_LINE        job_id(u16),               SEND ONE G-CODE LINE
+                             line_no(u16),
+                             gcode_text(≤63 bytes)
+  0x0F    OP_JOB_END         job_id(u16)                END JOB
+  0x10    OP_JOB_ABORT       job_id(u16)                ABORT JOB
+  0x11    OP_SET_FEED_OVERRIDE percent(f32)              Override feed rate
+  0x12    OP_MOVE            x(f32), y(f32),            Absolute G0/G1 move
+                             z(f32), feed(f32)
+
+3b. Device → Host Events
+
+  EVENT   NAME              PAYLOAD                    MEANING
+  ─────   ────              ───────                    ───────
+  0x01    EV_EXECUTED       job_id(u16),               A line finished executing
+                            line_no(u16),
+                            x(f32), y(f32), z(f32)
+  0x02    EV_JOB_DONE       job_id(u16)                All lines done, job complete
+  0x03    EV_FAULT          axis(u8), code(u8)         Axis fault
+  0x04    EV_ESTOP          (empty)                    E-stop triggered
+  0x05    EV_COMM_LOST      (empty)                    Link lost, device stopped
+  0x06    EV_STATUS         46-byte telemetry block    Periodic status push
+
+3c. Frame Types (transport layer)
+
+  TYPE  NAME     PURPOSE
+  ────  ────     ───────
+  0x01  FT_CMD   Host→device command
+  0x02  FT_RSP   Device reply to a command
+  0x03  FT_EVT   Device event (unsolicited)
+  0x04  FT_ACK   Acknowledgement (seq accepted)
+  0x05  FT_NAK   Negative acknowledgement (seq rejected + reason code)
+  0x06  FT_HB    Heartbeat (keep-alive)
+
+3d. Status Codes (device replies in RSP payload[1])
+
+  CODE  NAME              MEANING
+  ────  ────              ───────
+  0x00  ST_OK             Success
+  0x01  ST_ERR_INTERNAL   Internal error
+  0x02  ST_ERR_BUSY       Device busy, try again
+  0x03  ST_ERR_STATE      Not allowed in current machine state
+  0x04  ST_ERR_JOB        Job ID mismatch / no active job
+  0x05  ST_ERR_SEQ_GAP    Out-of-window sequence (resend from gap)
+  0x06  ST_ERR_CRC        Frame CRC failed
+  0x07  ST_ERR_BUFFER     Device planner full (flow control)
+  0x08  ST_ERR_CMD        Unknown command / bad payload
+  0x09  ST_ERR_ESTOP      E-stop latched, cannot execute
+  0x0A  ST_ERR_FAULT      Axis fault
+
+
+================================================================================
+4. RELIABILITY MECHANISMS
+================================================================================
+
+The job system has FOUR layers of reliability:
+
+  LAYER 1 — Frame Layer (backend/rsp/frame.py)
+    - CRC32 (IEEE 802.3) over every frame body
+    - Byte-stuffing: 0x7E, 0x5A, 0x7D inside body are escaped
+    - START(0x7E) / END(0x5A) delimiters for resynchronization
+    - Resynchronizing state machine parser recovers from garbage bytes
+
+  LAYER 2 — Stream Layer (backend/rsp/stream.py)
+    - Windowed transmission: up to 16 frames in-flight at once
+    - Every command with F_ACK flag gets ACK(seq) or NAK(seq, reason)
+    - Retransmission on RTO (~100ms) if no ACK arrives (up to 8 retries)
+    - SEQ_GAP recovery: device NAKs with ST_ERR_SEQ_GAP → resend from gap
+    - Buffer flow control: ST_ERR_BUFFER NAK → host backs off and retries
+    - Heartbeat: periodic FT_HB frames; 3× missed = LinkLost
+    - Stall timeout: if a command sits unresolved for 20s → LinkLost
+
+  LAYER 3 — Job Layer (backend/rsp/job.py)
+    - Execution credits: never send more lines than device planner depth (8)
+      Formula: sent_up_to - len(executed) < depth
+    - EV_EXECUTED tracking: each confirmed-executed line advances progress
+    - Stall detection:
+        * 20s no progress → stalled flag (UI warning)
+        * 90s no progress → abort job with failure reason
+    - Pause/Resume/Abort flow control
+
+  LAYER 4 — Telemetry Reconciliation (backend/rsp/job.py + machine.py)
+    - EV_EXECUTED is a fire-and-forget event (never retried)
+    - If one is lost, the executed-set gets permanently out of sync
+    - Solution: device telemetry (EV_STATUS) carries last_executed_line
+      as a reliable high-water mark
+    - note_progress() heals gaps by walking forward from last watermark
+    - Called every time a status update arrives with matching job_id
+
+
+================================================================================
+5. PAUSE / RESUME / ABORT
+================================================================================
+
+  PAUSE:
+    - Sends OP_FEED_HOLD (0x08) to device → motion pauses
+    - Sender loop stops sending new lines
+    - Device keeps accepted lines in planner
+
+  RESUME:
+    - Sends OP_RESUME (0x09) to device → motion resumes
+    - Sender loop resumes sending lines from where it left off
+    - Can resume from a specific line number (for recovery after link drop)
+
+  ABORT:
+    - Host-side: clears job state immediately, sets _active=False
+    - Sends OP_JOB_ABORT (0x10) to device (best-effort)
+    - Device flushes its planner, stops motion
+    - Re-enables heartbeats
+    - Next upload() is allowed immediately
+
+  HARD E-STOP:
+    - Calls abort_job() FIRST (stops host-side sender thread)
+    - Then sends OP_E_STOP (0x07) to device (cuts driver power)
+    - Two-phase: prevents race where a job line and E-STOP are both in flight
+
+
+================================================================================
+6. TEST RESULTS (ALL 35 PASSED)
+================================================================================
+
+Tests run: 35 passed in 41.00s
+Python: 3.12.6 | pytest 9.0.3
+
+  TEST                                                      STATUS
+  ──────────────────────────────────────────────────────    ──────
+  test_single_move_roundtrip                                PASSED
+  test_jog_roundtrip                                        PASSED
+  test_status_telemetry                                     PASSED
+  test_home_zero                                            PASSED
+  test_job_stream_clean (300 lines, clean link)             PASSED
+  test_job_stream_with_drops (150 lines, 0.5% byte drop)   PASSED
+  test_job_stream_with_corruption (100 lines, corrupt)      PASSED
+  test_move_with_corruption                                 PASSED
+  test_no_duplicate_execution                               PASSED
+  test_estop_propagation                                    PASSED
+  test_link_lost_detection                                  PASSED
+  test_resume_run_state                                     PASSED
+  test_ping_latency                                         PASSED
+  test_feed_override                                        PASSED
+  test_permanent_buffer_nak_trips_link_lost                 PASSED
+  test_job_stall_flag_recovers_when_device_unsticks         PASSED
+  test_job_completes_via_telemetry_when_executed_events_lost PASSED
+  test_hard_estop_aborts_job_and_reaches_firmware           PASSED
+  test_abort_clears_active_flag_for_reupload                PASSED
+  test_job_start_timeout_does_not_wedge_active_flag         PASSED
+  test_seq_gap_from_stale_session_advances_tx_seq           PASSED
+  test_start_resyncs_before_marking_ready                   PASSED
+  test_resync_recovers_from_stale_device_seq_on_reconnect   PASSED
+  test_motion_blocked_when_resync_cannot_reach_device       PASSED
+  test_alarm_state_blocks_move_but_allows_home_as_recovery  PASSED
+  test_orphan_job_auto_aborted_on_resync                    PASSED
+  test_abort_job_still_clears_a_manually_recorded_orphan    PASSED
+  test_completed_job_is_not_mistaken_for_an_orphan          PASSED
+  test_crc32_known_vector                                   PASSED
+  test_frame_roundtrip                                      PASSED
+  test_frame_stuffing_handles_markers                       PASSED
+  test_frame_rejects_corrupt_crc                            PASSED
+  test_frame_rejects_oversize                               PASSED
+  test_frame_rejects_short                                  PASSED
+  test_frame_escape_never_desyncs                           PASSED
+
+
+================================================================================
+7. HOW TO REPLICATE IN ANOTHER CONTROL SOFTWARE
+================================================================================
+
+To implement this job system in another control software, you need:
+
+  [ ] FRAME PROTOCOL
+      - Byte-stuffing with START(0x7E)/END(0x5A)/ESC(0x7D)
+      - CRC32 (IEEE 802.3) over frame body
+      - Frame types: CMD, RSP, EVT, ACK, NAK, HB
+      - Flags: F_ACK, F_LAST
+      - 16-bit sequence numbers
+      - Resynchronizing parser
+
+  [ ] STREAM RELIABILITY
+      - Windowed transmission (up to 16 frames in-flight)
+      - ACK/NAK handling per seq
+      - RTO retransmission (~100ms, up to 8 retries)
+      - SEQ_GAP recovery
+      - Buffer flow control (ST_ERR_BUFFER backoff)
+      - Heartbeat keep-alive + LinkLost detection
+      - Absolute stall timeout (20s per command)
+
+  [ ] JOB OPCODES (host→device)
+      - OP_JOB_START (0x0D): job_id, total_lines
+      - OP_JOB_LINE (0x0E): job_id, line_no, gcode (max 63 bytes)
+      - OP_JOB_END (0x0F): job_id
+      - OP_JOB_ABORT (0x10): job_id
+
+  [ ] JOB EVENTS (device→host)
+      - EV_EXECUTED (0x01): job_id, line_no, x, y, z
+      - EV_JOB_DONE (0x02): job_id
+
+  [ ] EXECUTION CREDITS
+      - Never send more lines than device planner can hold
+      - Formula: sent_up_to - len(executed) < depth (default 8)
+      - Prevents BUFFER NAK spam
+
+  [ ] STALL DETECTION
+      - Track last_progress_at (monotonic time)
+      - 20s no progress → stalled warning
+      - 90s no progress → abort job
+
+  [ ] TELEMETRY RECONCILIATION
+      - Device periodically sends EV_STATUS with last_executed_line
+      - Host uses note_progress() to heal gaps from lost EV_EXECUTED
+      - Idempotent: only walks forward from last watermark
+
+  [ ] FIRMWARE SIDE
+      - Frame parser (same byte-stuffing + CRC32)
+      - Seq tracker (expected_seq, SEQ_GAP on mismatch)
+      - ACK/NAK generation
+      - Planner queue (depth ≥ 8)
+      - G-code executor (pop from planner, execute, emit EV_EXECUTED)
+      - JOB_START/JOB_LINE/JOB_END/JOB_ABORT handlers
+      - Heartbeat responder
+      - Periodic telemetry (EV_STATUS)
+
+  [ ] HOST-SIDE MACHINE CONTROLLER
+      - Connection lifecycle: disconnected → connecting → resyncing → ready
+      - Resync on connect: query device state before trusting it
+      - Orphan job detection: auto-abort device-side jobs from old sessions
+      - Status broadcasting to UI (WebSocket)
+
+  [ ] PRE-PROCESSING PIPELINE
+      - Unit normalization: G20 (inch) → G21 (mm), scale all values
+      - Arc tessellation: G2/G3 (I/J form) → short G1 line segments
+
+================================================================================
+  END OF DOCUMENTATION
+================================================================================
