@@ -128,6 +128,7 @@ class RSPController extends EventEmitter {
         // GRBLController's Sender.js calls `received`. Used by getSenderStatus()
         // for the initial-sync sender:status emit.
         this._currentLine = 0;
+        this._lastAlarmEmitted = null;
 
         // Always a real object -- CNCEngine.js reads controller.state.status
         // / controller.state.parserstate unguarded from its 'status' and
@@ -399,6 +400,24 @@ class RSPController extends EventEmitter {
         };
         this.state.parserstate.feedrate = dict.feed;
         this.state.parserstate.spindle = dict.spindle_speed;
+
+        // Alarm / Fault / E-Stop detection: surface telemetry alarm states to frontend UI
+        if (dict.state === defs.ST_ALARM || dict.state === defs.ST_ESTOP || dict.state === defs.ST_FAULT || dict.estop_active) {
+            const alarmType = dict.estop_active ? 'estop' : (dict.state_name ? dict.state_name.toLowerCase() : 'alarm');
+            if (!this._lastAlarmEmitted || this._lastAlarmEmitted !== alarmType) {
+                this._lastAlarmEmitted = alarmType;
+                logger.warn(`[RSP] Controller in alarm state: ${alarmType} (state=${dict.state}, estop=${dict.estop_active})`);
+                this.emit('alarm', {
+                    type: alarmType,
+                    code: dict.error_code || 0,
+                    message: dict.estop_active ? 'E-Stop / Limit Switch Triggered' : `${dict.state_name || 'Alarm'} state`,
+                    description: 'Machine hit limit switch, motor faulted, or E-Stop was engaged. Click Clear / Unlock to reset.',
+                });
+            }
+        } else {
+            this._lastAlarmEmitted = null;
+        }
+
         if (this.job && this.job.active) {
             // EV_EXECUTED is fire-and-forget/lossy (see job.js noteProgress
             // doc) -- telemetry's last_executed_line is the ground truth
@@ -545,15 +564,20 @@ class RSPController extends EventEmitter {
             // driver ALM outputs), OP_UNLOCK may not clear it -- that would
             // need firmware-side EN-pin toggling or a real power cycle, a
             // firmware/hardware-layer fix this file cannot make.
+            case 'unlock':
             case 'motor:reset':
             case 'motor:resetAll':
             case 'estop:clear':
             case 'limit:clear':
+                this._lastAlarmEmitted = null;
                 this._fireAndForget(defs.OP_UNLOCK, Buffer.alloc(0));
+                this.emit('console', '[RSP] Alarm cleared / unlocked ($X)');
                 break;
 
             case 'reset':
+                this._lastAlarmEmitted = null;
                 this._fireAndForget(defs.OP_SOFT_RESET, Buffer.alloc(0));
+                this.emit('console', '[RSP] Soft reset sent.');
                 break;
 
             case 'feedhold':
