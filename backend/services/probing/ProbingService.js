@@ -194,7 +194,7 @@ class ProbingService extends EventEmitter {
                 // retreat-to-true-zero moves) intentionally stay on
                 // slowFind -- those set the actual WCS zero point, so
                 // accuracy still matters there.
-                const TRAVERSE = (s.traverseFeed || 1500);
+                const TRAVERSE = (s.traverseFeed || 2500);
 
                 // Step 1: probe Z- (top surface), record Z0. Auto-zeroes Z.
                 const zr = await doProbe(AXIS.Z, 1, s.zProbeDistance, s.fastFind, 'Z');
@@ -293,8 +293,9 @@ class ProbingService extends EventEmitter {
         if (!ctl) throw new Error('No active controller');
         if (typeof ctl._moveAbsolute !== 'function') throw new Error('Controller has no RSP-native move primitive');
         const s = this.configStore.get('probeSettings') || {};
-        const TRAVERSE = (s.traverseFeed || 1500);
-        const SLOW = (s.slowFind || 75);
+        const TRAVERSE = (s.traverseFeed || 2500);
+        const Z_FEED = (s.finalizeZFeed || 1500);
+        const XY_FEED = (s.finalizeXYFeed || TRAVERSE);
         const startX = (s.postProbeX ?? 27);
         const startY = (s.postProbeY ?? 25);
         const startZ = (s.postProbeZ ?? 15);
@@ -308,19 +309,22 @@ class ProbingService extends EventEmitter {
         };
 
         try {
-            // Step 1: Move Z down by 30mm (15mm to touch plate level + 15mm plate thickness) to touch wood surface, then re-zero Z
+            // Step 1: Move Z down to real surface (touch plate was removed by user) and re-zero Z at surface
             const targetZ = startZ - zDrop; // 15 - 30 = -15
-            await ctl._moveAbsolute(startX, startY, targetZ, SLOW);
+            await ctl._moveAbsolute(startX, startY, targetZ, Z_FEED);
             checkAborted();
             try { ctl.command('wcs:zero', { z: 0 }); } catch (_) { /* best-effort */ }
 
-            // Step 2: Move X + 8mm (27 + 8 = 35)
-            await ctl._moveAbsolute(startX + xAdd, startY, 0, TRAVERSE);
+            // Step 2: Move X + 8mm (27 + 8 = 35) to clear block area
+            await ctl._moveAbsolute(startX + xAdd, startY, 0, XY_FEED);
             checkAborted();
 
-            // Step 3: Move Y + 10mm (25 + 10 = 35)
-            await ctl._moveAbsolute(startX + xAdd, startY + yAdd, 0, TRAVERSE);
+            // Step 3: Move Y + 10mm (25 + 10 = 35) to reach final zero position
+            await ctl._moveAbsolute(startX + xAdd, startY + yAdd, 0, XY_FEED);
             checkAborted();
+
+            // Step 4: Zero all axes (X, Y, Z) at final corner position so DRO reads (0, 0, 0)
+            try { ctl.command('wcs:zeroAll'); } catch (_) { /* best-effort */ }
 
             this.io.emit('probing:result', { strategy: 'finalize-corner-zero', success: true });
             return { success: true };

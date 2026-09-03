@@ -128,6 +128,7 @@ class RSPController extends EventEmitter {
         // GRBLController's Sender.js calls `received`. Used by getSenderStatus()
         // for the initial-sync sender:status emit.
         this._currentLine = 0;
+        this._lastAlarmEmitted = null;
 
         // Always a real object -- CNCEngine.js reads controller.state.status
         // / controller.state.parserstate unguarded from its 'status' and
@@ -396,9 +397,40 @@ class RSPController extends EventEmitter {
             feedHold: dict.feed_hold,
             estop: dict.estop_active,
             feedOverridePct: this._feedOverridePct,
+            lastExecutedLine: dict.last_executed_line,
+            /* job-63998 debug extension (fw_m3 stepper.c jogeng_debug_get(),
+             * defs.js asDict()) -- passed through so SessionLogger can record
+             * it. Previously dropped here, so every past stall log only had
+             * x/y/z; no way to tell "TIM2 ISR dead" from "ISR looping,
+             * steps_done stuck" from "leg finished, poll() never drained it"
+             * after the fact. Remove alongside the firmware fields once
+             * root-caused. */
+            dbgJogActive: dict.dbg_jog_active,
+            dbgJogDoneEvt: dict.dbg_jog_done_evt,
+            dbgTim2IsrCount: dict.dbg_tim2_isr_count,
+            dbgStepsDone: dict.dbg_steps_done,
+            dbgStepsTotal: dict.dbg_steps_total,
         };
         this.state.parserstate.feedrate = dict.feed;
         this.state.parserstate.spindle = dict.spindle_speed;
+
+        // Alarm / Fault / E-Stop detection: surface telemetry alarm states to frontend UI
+        if (dict.state === defs.ST_ALARM || dict.state === defs.ST_ESTOP || dict.state === defs.ST_FAULT || dict.estop_active) {
+            const alarmType = dict.estop_active ? 'estop' : (dict.state_name ? dict.state_name.toLowerCase() : 'alarm');
+            if (!this._lastAlarmEmitted || this._lastAlarmEmitted !== alarmType) {
+                this._lastAlarmEmitted = alarmType;
+                logger.warn(`[RSP] Controller in alarm state: ${alarmType} (state=${dict.state}, estop=${dict.estop_active})`);
+                this.emit('alarm', {
+                    type: alarmType,
+                    code: dict.error_code || 0,
+                    message: dict.estop_active ? 'E-Stop / Limit Switch Triggered' : `${dict.state_name || 'Alarm'} state`,
+                    description: 'Machine hit limit switch, motor faulted, or E-Stop was engaged. Click Clear / Unlock to reset.',
+                });
+            }
+        } else {
+            this._lastAlarmEmitted = null;
+        }
+
         if (this.job && this.job.active) {
             // EV_EXECUTED is fire-and-forget/lossy (see job.js noteProgress
             // doc) -- telemetry's last_executed_line is the ground truth
@@ -545,15 +577,20 @@ class RSPController extends EventEmitter {
             // driver ALM outputs), OP_UNLOCK may not clear it -- that would
             // need firmware-side EN-pin toggling or a real power cycle, a
             // firmware/hardware-layer fix this file cannot make.
+            case 'unlock':
             case 'motor:reset':
             case 'motor:resetAll':
             case 'estop:clear':
             case 'limit:clear':
+                this._lastAlarmEmitted = null;
                 this._fireAndForget(defs.OP_UNLOCK, Buffer.alloc(0));
+                this.emit('console', '[RSP] Alarm cleared / unlocked ($X)');
                 break;
 
             case 'reset':
+                this._lastAlarmEmitted = null;
                 this._fireAndForget(defs.OP_SOFT_RESET, Buffer.alloc(0));
+                this.emit('console', '[RSP] Soft reset sent.');
                 break;
 
             case 'feedhold':
@@ -583,6 +620,15 @@ class RSPController extends EventEmitter {
             case 'gcode:load': {
                 const [name, gcode] = args;
                 const incoming = gcode || '';
+                // If a job is still active (e.g. user stopped mid-carve but
+                // the JobStream hasn't fully wound down yet), abort it now so
+                // the new file can be started cleanly -- without this the old
+                // job's `active` flag stays true and _startJob() rejects the
+                // next START with "a job is already running".
+                if (this.job && this.job.active) {
+                    logger.info('[RSP] gcode:load — aborting previous active job before loading new file');
+                    this.job.abort();
+                }
                 this._loadedName = name || '';
                 this._loadedGcode = incoming;
                 // Power-cut recovery is now handled by JobResumeService,
