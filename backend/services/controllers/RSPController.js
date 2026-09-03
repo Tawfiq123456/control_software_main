@@ -268,7 +268,7 @@ class RSPController extends EventEmitter {
 
     _bindJobListeners() {
         if (!this.job) return;
-        this.job.on('progress', ({ executed, total, lineNo }) => {
+        this.job.on('progress', ({ executed, total, lineNo, pos }) => {
             // Emit under the same field names GRBLController/Sender.js uses
             // (received/total/progress) instead of RSP-only names -- the
             // frontend's sender:status listener (backendConnection.ts) reads
@@ -285,7 +285,7 @@ class RSPController extends EventEmitter {
                 progress: total > 0 ? Math.round((executed / total) * 100) : 0,
                 remaining: Math.max(0, total - executed),
                 lineNo,
-                pos,
+                pos: pos || this.state?.status?.mpos || { x: 0, y: 0, z: 0 },
             });
         });
         this.job.on('done', ({ jobId, failReason }) => {
