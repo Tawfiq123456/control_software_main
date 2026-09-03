@@ -583,6 +583,15 @@ class RSPController extends EventEmitter {
             case 'gcode:load': {
                 const [name, gcode] = args;
                 const incoming = gcode || '';
+                // If a job is still active (e.g. user stopped mid-carve but
+                // the JobStream hasn't fully wound down yet), abort it now so
+                // the new file can be started cleanly -- without this the old
+                // job's `active` flag stays true and _startJob() rejects the
+                // next START with "a job is already running".
+                if (this.job && this.job.active) {
+                    logger.info('[RSP] gcode:load — aborting previous active job before loading new file');
+                    this.job.abort();
+                }
                 this._loadedName = name || '';
                 this._loadedGcode = incoming;
                 // Power-cut recovery is now handled by JobResumeService,
