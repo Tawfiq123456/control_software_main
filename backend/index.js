@@ -24,6 +24,7 @@ const { GamepadService } = require('./services/gamepad/GamepadService');
 const { WatchDirService } = require('./services/watchdir/WatchDirService');
 const { ProbingService } = require('./services/probing/ProbingService');
 const { JobHistoryService } = require('./services/jobhistory/JobHistoryService');
+const { JobResumeService } = require('./services/jobresume/JobResumeService');
 const { ToolLibrary } = require('./services/toollibrary/ToolLibrary');
 const { WhatsAppService } = require('./services/whatsapp/WhatsAppService');
 const { TelegramBotService } = require('./services/telegram/TelegramBotService');
@@ -82,6 +83,8 @@ const gamepadService    = new GamepadService({    configStore: engine.config, io
 const watchdirService   = new WatchDirService({   configStore: engine.config, io, logger });
 const probingService    = new ProbingService({    configStore: engine.config, io, logger, getController });
 const jobHistoryService = new JobHistoryService({ dataDir,                    io, logger, getController });
+const jobResumeService  = new JobResumeService({  dataDir, io, logger, getController,
+                                                  getConfig: () => engine.config });
 const toolLibrary       = new ToolLibrary({       configStore: engine.config, io, logger });
 const libraryService    = new LibraryService({    dataDir, io, logger });
 const whatsappService   = new WhatsAppService({   configStore: engine.config, io, logger,
@@ -90,6 +93,10 @@ const whatsappService   = new WhatsAppService({   configStore: engine.config, io
 const telegramService   = new TelegramBotService({ configStore: engine.config, io, logger,
                                                    getController, getEngine: () => engine, dataDir,
                                                    libraryService, webcamService });
+
+// Wire JobResumeService to the CNCEngine so it can be used by the
+// job:conflict/job:resume socket handlers.
+engine.jobResumeService = jobResumeService;
 
 webcamService.init();
 gamepadService.init();
@@ -371,6 +378,31 @@ app.get('/api/jobhistory/:id', (req, res) => {
 });
 app.delete('/api/jobhistory', (req, res) => { jobHistoryService.clear(); res.json({ ok: true }); });
 app.delete('/api/jobhistory/:id', (req, res) => { jobHistoryService.deleteOne(req.params.id); res.json({ ok: true }); });
+
+// ─── Job Resume / Checkpoint REST API ───────────────────────────────
+
+app.get('/api/job/checkpoint', (req, res) => {
+    const meta = jobResumeService.getCheckpointMeta();
+    res.json(meta || { checkpoint: null });
+});
+
+app.get('/api/job/checkpoint/valid', (req, res) => {
+    res.json(jobResumeService.validateCheckpoint());
+});
+
+app.post('/api/job/resume', (req, res) => {
+    const result = jobResumeService.resumeFromCheckpoint(req.body || {});
+    if (result.ok) {
+        res.json(result);
+    } else {
+        res.status(400).json(result);
+    }
+});
+
+app.delete('/api/job/checkpoint', (req, res) => {
+    jobResumeService.clearCheckpoint();
+    res.json({ ok: true });
+});
 
 // ─── Tool Library REST (v2 — replaces engine.config tools API) ───
 

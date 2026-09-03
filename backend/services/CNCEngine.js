@@ -53,6 +53,12 @@ class CNCEngine extends EventEmitter {
             path.join(__dirname, '..', 'data', 'config.json')
         );
 
+        /** @type {import('./jobresume/JobResumeService').JobResumeService|null} */
+        this.jobResumeService = null;
+
+        // Track whether a job is in a paused state for file-upload conflict detection.
+        this._jobPaused = false;
+
         // ECSS-E: bring up the remote diag mirror if the user previously
         // toggled it on. The mirror connects out; it never accepts inbound
         // connections, so this is safe to fire-and-forget on boot.
@@ -235,7 +241,51 @@ class CNCEngine extends EventEmitter {
                 }
             });
 
-            // ─── Cleanup ─────────────────────────────────────────
+            // ─── Job Isolation (paused-job conflict resolution) ───────
+            socket.on('job:conflict:replace', () => {
+                // User chose to replace the paused job with the new file.
+                logger.info('[Engine] job:conflict:replace — aborting paused job');
+                if (this.controller) {
+                    this.controller.command('gcode:stop');
+                }
+                if (this.jobResumeService) {
+                    this.jobResumeService.clearCheckpoint();
+                }
+                this._jobPaused = false;
+                // The file:load that was rejected will be retried by the
+                // frontend after receiving 'job:conflict:resolved'.
+                this.io.emit('job:conflict:resolved', { action: 'replaced' });
+            });
+
+            socket.on('job:conflict:cancel', () => {
+                // User chose to keep the paused job — reject the upload.
+                logger.info('[Engine] job:conflict:cancel — keeping paused job');
+                this.io.emit('job:conflict:resolved', { action: 'cancelled' });
+            });
+
+            socket.on('job:conflict:save', () => {
+                // User chose to save the paused job checkpoint, then allow the new file.
+                logger.info('[Engine] job:conflict:save — saving checkpoint then clearing');
+                if (this.controller) {
+                    this.controller.command('gcode:stop');
+                }
+                // Checkpoint is already saved by the stop handler via JobResumeService.
+                // Don't clear it — user explicitly asked to save.
+                this._jobPaused = false;
+                this.io.emit('job:conflict:resolved', { action: 'saved' });
+            });
+
+            socket.on('job:resume:confirm', (opts) => {
+                // User confirmed they want to resume from the checkpoint.
+                if (this.jobResumeService) {
+                    const result = this.jobResumeService.resumeFromCheckpoint(opts || {});
+                    socket.emit('job:resume:result', result);
+                } else {
+                    socket.emit('job:resume:result', { ok: false, error: 'Resume service not available' });
+                }
+            });
+
+            // ─── Cleanup ─────────────────────────────────────────────
             socket.on('disconnect', () => {
                 logger.info(`Socket.IO client disconnected: ${socket.id}`);
                 if (this.connection) {
@@ -499,17 +549,25 @@ class CNCEngine extends EventEmitter {
             this.io.emit('sender:status', status);
         });
 
+        // Sender paused — track for job isolation guard
+        this.controller.on('sender:pause', () => {
+            this._jobPaused = true;
+            this.io.emit('sender:pause');
+        });
+
         this.controller.on('sender:start', (data) => {
             this.io.emit('sender:start', data);
             if (this.sessionLogger) this.sessionLogger.logJob({ event: 'started' });
         });
 
         this.controller.on('sender:end', (data) => {
+            this._jobPaused = false;
             this.io.emit('sender:end', data);
             if (this.sessionLogger) this.sessionLogger.logJob({ event: 'completed', ...data });
         });
 
         this.controller.on('sender:error', (err) => {
+            this._jobPaused = false;
             this.io.emit('sender:error', err);
             if (this.sessionLogger) this.sessionLogger.logJob({ event: 'error', ...err });
         });
@@ -806,6 +864,26 @@ class CNCEngine extends EventEmitter {
 
         const fileName = name || 'untitled.gcode';
         logger.info(`[Engine] file:load received: name="${fileName}" bytes=${gcodeContent.length}`);
+
+        // ─── Job Isolation Guard ─────────────────────────────────────
+        // If a job is currently paused, don't silently overwrite the loaded
+        // G-code. Emit a conflict event so the frontend can show a modal
+        // asking the user what to do (replace / cancel / save & replace).
+        if (this._jobPaused) {
+            const senderStatus = (typeof this.controller?.getSenderStatus === 'function')
+                ? this.controller.getSenderStatus() : null;
+            const pausedInfo = {
+                filename: this.loadedFile?.name || 'unknown',
+                resumeLine: senderStatus?.received || 0,
+                totalLines: senderStatus?.total || 0,
+                newFilename: fileName,
+            };
+            logger.warn(`[Engine] file:load blocked — job is paused: ${JSON.stringify(pausedInfo)}`);
+            socket.emit('job:conflict', pausedInfo);
+            // Store the pending upload so it can be retried after conflict resolution.
+            this._pendingUpload = { name: fileName, content: gcodeContent };
+            return;
+        }
 
         // Load into controller's sender
         this.controller.command('gcode:load', fileName, gcodeContent);

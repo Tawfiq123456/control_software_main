@@ -30,9 +30,6 @@
  */
 'use strict';
 
-const fs = require('fs');
-const path = require('path');
-const crypto = require('crypto');
 const { EventEmitter } = require('events');
 const logger = require('../../logger');
 const defs = require('../rsp/defs');
@@ -40,19 +37,12 @@ const codec = require('../rsp/codec');
 const { ReliableStream, LinkLost } = require('../rsp/stream');
 const { JobStream } = require('../rsp/job');
 
-// Power-cut survival (Tawfiq msg11347 item 2): a single-record JSON file
-// tracking the resume point of whatever job was running. Written
-// periodically during a run and on gcode:stop, read once at controller
-// construction (a fresh RSPController is built per connection -- see
-// services/controllers/index.js's createController() -- so this fires
-// right after a backend restart, which is exactly when in-memory
-// _resumeLine/_resumeGcode has been lost). Not a queue/history -- job.js
-// stays 100% in-memory; this is the one exception, deliberately minimal.
-const RESUME_STATE_PATH = path.join(__dirname, '..', '..', 'data', 'rsp_resume_state.json');
-// Persisting on every executed line would mean a sync fs.writeFileSync per
-// line on the hot progress path; a crash between writes only costs this
-// many lines of resume accuracy, which is an acceptable tradeoff.
-const RESUME_PERSIST_EVERY_N_LINES = 20;
+// Power-cut survival: durable checkpoint persistence is now handled
+// entirely by JobResumeService (services/jobresume/), which owns the
+// single job_resume.json file with CRC32 protection and atomic writes.
+// RSPController no longer writes rsp_resume_state.json directly.
+// The volatile _resumeLine/_resumeGcode bookkeeping below is still
+// kept for fast in-session pause/resume (same process, no restart).
 
 // --------------------------------------------------------------------------
 // Axis encoding assumption (NOT explicitly defined anywhere in the ported
@@ -181,11 +171,6 @@ class RSPController extends EventEmitter {
         // cleanly) clears it, so a genuinely new run always starts at line 1.
         this._resumeLine = 0;
         this._resumeGcode = null;
-        // Disk-recovered resume record (if any), consumed by the FIRST
-        // gcode:load this instance sees. Not applied yet here -- we don't
-        // have loaded gcode content to hash-match against until then.
-        this._diskResumeRecord = this._loadResumeStateFromDisk();
-        this._diskResumeConsumed = false;
         this._feedOverridePct = 100.0;
         this._debugEnabled = false;
 
@@ -252,42 +237,33 @@ class RSPController extends EventEmitter {
     }
 
     // ------------------------------------------------------------------
-    // resume-state persistence (power-cut survival, item 2)
+    // Modal state — used by JobResumeService to capture the current
+    // machine state for checkpoints (WCS, units, distance mode, feed,
+    // spindle, coolant, tool).
     // ------------------------------------------------------------------
-    _gcodeHash(text) {
-        return crypto.createHash('sha1').update(text || '').digest('hex');
-    }
+    /**
+     * Returns the current modal state of the machine, extracted from
+     * telemetry and parser state. Used by the checkpoint system.
+     *
+     * @returns {object} Modal state object matching JobResumeStore schema.
+     */
+    getModalState() {
+        const st = this.state?.status || {};
+        const ps = this.state?.parserstate || {};
+        const modal = ps.modal || {};
 
-    _loadResumeStateFromDisk() {
-        try {
-            if (!fs.existsSync(RESUME_STATE_PATH)) return null;
-            const rec = JSON.parse(fs.readFileSync(RESUME_STATE_PATH, 'utf8'));
-            if (rec && typeof rec.gcodeHash === 'string' && typeof rec.resumeLine === 'number') return rec;
-            return null;
-        } catch (e) {
-            logger.warn(`[RSP] resume-state load failed: ${e.message}`);
-            return null;
-        }
-    }
-
-    _persistResumeState(line) {
-        if (!this._loadedGcode || !(line > 1)) return;
-        try {
-            fs.mkdirSync(path.dirname(RESUME_STATE_PATH), { recursive: true });
-            const rec = {
-                name: this._loadedName,
-                gcodeHash: this._gcodeHash(this._loadedGcode),
-                resumeLine: line,
-                updatedAt: Date.now(),
-            };
-            fs.writeFileSync(RESUME_STATE_PATH, JSON.stringify(rec), 'utf8');
-        } catch (e) {
-            logger.warn(`[RSP] resume-state write failed: ${e.message}`);
-        }
-    }
-
-    _clearResumeState() {
-        try { fs.unlinkSync(RESUME_STATE_PATH); } catch (_) { /* nothing to clear */ }
+        return {
+            wcs:             modal.wcs || 'G54',
+            units:           modal.units || 'G21',
+            distanceMode:    modal.distance || 'G90',
+            feedMode:        modal.feedmode || 'G94',
+            spindleState:    modal.spindle || (st.spindle > 0 ? 'M3' : 'M5'),
+            spindleRpm:      st.spindle || ps.spindle || 0,
+            coolantState:    modal.coolant || 'M9',
+            feedRate:        st.feedrate || ps.feedrate || 0,
+            toolNumber:      modal.tool || 0,
+            feedOverridePct: this._feedOverridePct,
+        };
     }
 
     _bindJobListeners() {
@@ -308,14 +284,9 @@ class RSPController extends EventEmitter {
                 received: lineNo,
                 progress: total > 0 ? Math.round((executed / total) * 100) : 0,
                 remaining: Math.max(0, total - executed),
+                lineNo,
+                pos,
             });
-            // Power-cut survival: a hard crash/power-loss never reaches
-            // gcode:stop, so the resume point also has to be checkpointed
-            // periodically while the job is running, not only on a clean
-            // stop.
-            if (executed % RESUME_PERSIST_EVERY_N_LINES === 0) {
-                this._persistResumeState(lineNo);
-            }
         });
         this.job.on('done', ({ jobId, failReason }) => {
             if (failReason) {
@@ -326,7 +297,6 @@ class RSPController extends EventEmitter {
                 // the same file runs from line 1, not "resume from the end".
                 this._resumeLine = 0;
                 this._resumeGcode = null;
-                this._clearResumeState();
                 this.emit('sender:end', { jobId });
             }
         });
@@ -343,7 +313,6 @@ class RSPController extends EventEmitter {
             if (stopLine > 1) {
                 this._resumeLine = stopLine;
                 this._resumeGcode = this._loadedGcode;
-                this._persistResumeState(stopLine);
             }
             this.emit('sender:error', { reason });
         });
@@ -369,7 +338,6 @@ class RSPController extends EventEmitter {
             if (resumeLine > 1) {
                 this._resumeLine = resumeLine;
                 this._resumeGcode = this._loadedGcode;
-                this._persistResumeState(resumeLine);
             }
         }
         return { jobWasActive, resumeLine };
@@ -615,37 +583,14 @@ class RSPController extends EventEmitter {
             case 'gcode:load': {
                 const [name, gcode] = args;
                 const incoming = gcode || '';
-                // Power-cut recovery: the FIRST load this controller instance
-                // sees is checked against whatever resume record survived a
-                // backend restart (constructor-time _loadResumeStateFromDisk).
-                // If the frontend reloaded the exact same file (it does this
-                // automatically on reconnect -- see App.tsx's restore effect)
-                // and there's an unfinished-job record for it, treat it as
-                // resumable instead of wiping to line 1. Every load AFTER
-                // this first one keeps the original "fresh file = fresh
-                // start" behavior, including reloading the same file a
-                // second time within one session.
-                if (!this._diskResumeConsumed) {
-                    this._diskResumeConsumed = true;
-                    const rec = this._diskResumeRecord;
-                    if (rec && rec.resumeLine > 1 && rec.gcodeHash === this._gcodeHash(incoming)) {
-                        this._loadedName = name || '';
-                        this._loadedGcode = incoming;
-                        this._resumeLine = rec.resumeLine;
-                        this._resumeGcode = incoming;
-                        logger.info(`[RSP] gcode:load recovered unfinished job "${this._loadedName}" -- resumable at line ${rec.resumeLine}`);
-                        this.emit('console', `🔁 Recovered a job that was running before the last restart. Press START to resume from line ${rec.resumeLine}, or load a different file to start fresh.`);
-                        break;
-                    }
-                }
                 this._loadedName = name || '';
                 this._loadedGcode = incoming;
-                // A freshly loaded file is a new job, even if it happens to
-                // have the same name/content as one that was stopped earlier
-                // -- always start it at line 1, not mid-file.
+                // Power-cut recovery is now handled by JobResumeService,
+                // which intercepts at a higher level. Here we just treat
+                // every load as a fresh start for the volatile in-session
+                // resume bookkeeping.
                 this._resumeLine = 0;
                 this._resumeGcode = null;
-                this._clearResumeState();
                 logger.info(`[RSP] gcode:load "${this._loadedName}" (${this._loadedGcode.length} bytes)`);
                 break;
             }
@@ -656,7 +601,6 @@ class RSPController extends EventEmitter {
                 this._loadedName = '';
                 this._resumeLine = 0;
                 this._resumeGcode = null;
-                this._clearResumeState();
                 break;
 
             case 'gcode:start':
@@ -678,6 +622,7 @@ class RSPController extends EventEmitter {
             case 'gcode:pause':
                 if (this.job) this.job.pause();
                 this._fireAndForget(defs.OP_FEED_HOLD, Buffer.alloc(0));
+                this.emit('sender:pause');
                 break;
 
             case 'gcode:resume':
@@ -695,12 +640,10 @@ class RSPController extends EventEmitter {
                 if (stopLine > 1) {
                     this._resumeLine = stopLine;
                     this._resumeGcode = this._loadedGcode;
-                    this._persistResumeState(stopLine);
                     this.emit('console', `⏹️ Stopped at line ${stopLine}. Press START to resume from here, or load a new file to restart.`);
                 } else {
                     this._resumeLine = 0;
                     this._resumeGcode = null;
-                    this._clearResumeState();
                 }
                 break;
             }

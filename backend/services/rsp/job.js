@@ -71,6 +71,7 @@ class JobStream extends EventEmitter {
         this._sentUpTo = 0;          // next line index to transmit
         this._executed = new Set();  // line numbers that completed (EV_EXECUTED)
         this._acked = new Set();     // line numbers accepted by device (reserved for parity; not populated, mirrors Python which also never populates it)
+        this._sentLines = new Set(); // line numbers sent to the device's planner (sent but not necessarily executed)
         this._active = false;
         this._paused = false;
         this._aborted = false;
@@ -87,6 +88,9 @@ class JobStream extends EventEmitter {
         // once it goes stale -- see abort()+upload() race note in upload()
         // for why _aborted alone can't gate this.
         this._generation = 0;
+        // Last confirmed position from EV_EXECUTED events (x, y, z).
+        // Used by the checkpoint system to capture where the tool was.
+        this._lastConfirmedPos = { x: 0, y: 0, z: 0 };
 
         this._tickHandle = null;
 
@@ -127,9 +131,40 @@ class JobStream extends EventEmitter {
         return this._stalled;
     }
 
+    /** Last confirmed machine position from EV_EXECUTED. */
+    get lastConfirmedPos() {
+        return { ...this._lastConfirmedPos };
+    }
+
     /** First not-yet-executed line (for resume). */
     nextLineToRun() {
         return this._nextLine;
+    }
+
+    /**
+     * Planner buffer state — used by the checkpoint system to determine
+     * the correct resume point accounting for lines that were ACK'd
+     * (accepted into the device's planner) but not yet confirmed as
+     * executed. After a pause/stop, these lines may or may not have
+     * actually run on the device.
+     *
+     * @returns {{ lastExecuted: number, firstUnconfirmed: number, inPlannerCount: number }}
+     */
+    plannerState() {
+        const lastExecuted = this._nextLine - 1;
+        // Find the earliest line that was sent but NOT executed.
+        let firstUnconfirmed = this._nextLine;
+        for (const ln of this._sentLines) {
+            if (!this._executed.has(ln) && ln < firstUnconfirmed) {
+                firstUnconfirmed = ln;
+            }
+        }
+        // Count lines in the planner (sent but not executed).
+        let inPlannerCount = 0;
+        for (const ln of this._sentLines) {
+            if (!this._executed.has(ln)) inPlannerCount++;
+        }
+        return { lastExecuted, firstUnconfirmed, inPlannerCount };
     }
 
     // ------------------------------------------------------------------
@@ -159,6 +194,7 @@ class JobStream extends EventEmitter {
         this._sentUpTo = 0;
         this._executed = new Set();
         this._acked = new Set();
+        this._sentLines = new Set();
         this._nextLine = 1;
         this._active = true;
         this._paused = false;
@@ -169,6 +205,7 @@ class JobStream extends EventEmitter {
         this._failReason = null;
         this._lastProgressAt = now();
         this._stalled = false;
+        this._lastConfirmedPos = { x: 0, y: 0, z: 0 };
         this._linkDownSince = null;
         // Interleaving FT_HB heartbeats with pipelined job lines slows/stalls
         // the firmware's move execution -- suppress them for the job's
@@ -415,6 +452,7 @@ class JobStream extends EventEmitter {
             const payload = codec.buildJobLine(this._jobId, lineNo, gcode);
             const seq = this.stream.sendNowait(defs.OP_JOB_LINE, payload);
             if (seq < 0) break; // window full
+            this._sentLines.add(lineNo);
             this._sentUpTo += 1;
         }
     }
@@ -461,10 +499,17 @@ class JobStream extends EventEmitter {
         // active NOW, corrupting its executed-set.
         if (parsed.jobId !== this._jobId) return;
         this._executed.add(parsed.lineNo);
+        this._sentLines.delete(parsed.lineNo); // confirmed executed — no longer "in planner"
         this._nextLine = Math.max(this._nextLine, parsed.lineNo + 1);
+        this._lastConfirmedPos = { x: parsed.x, y: parsed.y, z: parsed.z };
         this._lastProgressAt = now();
         this._stalled = false;
-        this.emit('progress', { executed: this._executed.size, total: this._lines.length, lineNo: parsed.lineNo });
+        this.emit('progress', {
+            executed: this._executed.size,
+            total: this._lines.length,
+            lineNo: parsed.lineNo,
+            pos: this._lastConfirmedPos,
+        });
     }
 
     /** Called on EV_JOB_DONE. */
