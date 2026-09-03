@@ -397,6 +397,19 @@ class RSPController extends EventEmitter {
             feedHold: dict.feed_hold,
             estop: dict.estop_active,
             feedOverridePct: this._feedOverridePct,
+            lastExecutedLine: dict.last_executed_line,
+            /* job-63998 debug extension (fw_m3 stepper.c jogeng_debug_get(),
+             * defs.js asDict()) -- passed through so SessionLogger can record
+             * it. Previously dropped here, so every past stall log only had
+             * x/y/z; no way to tell "TIM2 ISR dead" from "ISR looping,
+             * steps_done stuck" from "leg finished, poll() never drained it"
+             * after the fact. Remove alongside the firmware fields once
+             * root-caused. */
+            dbgJogActive: dict.dbg_jog_active,
+            dbgJogDoneEvt: dict.dbg_jog_done_evt,
+            dbgTim2IsrCount: dict.dbg_tim2_isr_count,
+            dbgStepsDone: dict.dbg_steps_done,
+            dbgStepsTotal: dict.dbg_steps_total,
         };
         this.state.parserstate.feedrate = dict.feed;
         this.state.parserstate.spindle = dict.spindle_speed;

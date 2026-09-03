@@ -498,7 +498,22 @@ class CNCEngine extends EventEmitter {
                 parserstate: this.controller.state.parserstate,
             });
             if (this.sessionLogger) {
-                this.sessionLogger.logPosition(status.wpos || status.mpos);
+                const pos = status.wpos || status.mpos;
+                /* job-63998 debug extension -- see RSPController.js
+                 * _onTelemetry(). Only RSPController sets these; every other
+                 * controller leaves them undefined and JSON.stringify drops
+                 * undefined keys, so this is a no-op for GRBL/RTS sessions. */
+                this.sessionLogger.logPosition({
+                    ...pos,
+                    last_executed_line: status.lastExecutedLine,
+                    state: status.state,
+                    estop_active: status.estop,
+                    dbg_jog_active: status.dbgJogActive,
+                    dbg_jog_done_evt: status.dbgJogDoneEvt,
+                    dbg_tim2_isr_count: status.dbgTim2IsrCount,
+                    dbg_steps_done: status.dbgStepsDone,
+                    dbg_steps_total: status.dbgStepsTotal,
+                });
             }
             // ECSS — re-validate if the WCO has changed since last run.
             const wco = status?.wco || this.controller?._wco;
