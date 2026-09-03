@@ -94,7 +94,9 @@ const DEFAULT_CONFIG = {
         fastFind: 150,
         slowFind: 75,
         retraction: 2,
-        traverseFeed: 1500,
+        traverseFeed: 2500,
+        finalizeZFeed: 1500,
+        finalizeXYFeed: 2500,
         // xyz-corner probe geometry (ProbingService.js _runRSP) -- split out
         // from blockThickness/xyThickness formulas per msg11454's exact
         // spec, so future tuning is a config change, not a code ship.
