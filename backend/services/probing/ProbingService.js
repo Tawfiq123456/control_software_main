@@ -323,6 +323,9 @@ class ProbingService extends EventEmitter {
             await ctl._moveAbsolute(startX + xAdd, startY + yAdd, 0, XY_FEED);
             checkAborted();
 
+            // Step 4: Zero all axes (X, Y, Z) at final corner position so DRO reads (0, 0, 0)
+            try { ctl.command('wcs:zeroAll'); } catch (_) { /* best-effort */ }
+
             this.io.emit('probing:result', { strategy: 'finalize-corner-zero', success: true });
             return { success: true };
         } catch (err) {
